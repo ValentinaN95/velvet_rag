@@ -1,0 +1,353 @@
+import os
+from typing import List
+from llama_index.core import VectorStoreIndex, Document, ServiceContext, set_global_service_context
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.llms.huggingface import HuggingFaceInferenceAPI
+from llama_index.core.storage.storage_context import StorageContext
+from llama_index.vector_stores.chroma import ChromaVectorStore
+import chromadb
+import PyPDF2
+
+class VelvetRAGSystem:
+    def __init__(self, persist_dir: str = "./storage", cloud_embeddings: bool = True):
+        """
+        Sistema RAG con Hugging Face Velvet 7B
+        
+        Args:
+            persist_dir: Directory per salvare l'indice vettoriale
+            cloud_embeddings: True per usare embeddings cloud, False per locale
+        """
+        self.persist_dir = persist_dir
+        self.cloud_embeddings = cloud_embeddings
+        self.index = None
+        self.query_engine = None
+        
+        # Verifica API key
+        self.hf_token = os.getenv("HUGGINGFACE_API_KEY")
+        if not self.hf_token:
+            raise ValueError(
+                "Imposta HUGGINGFACE_API_KEY come variabile d'ambiente!\n"
+                "Ottieni il token su: https://huggingface.co/settings/tokens\n"
+                "Comando: export HUGGINGFACE_API_KEY='your-token-here'"
+            )
+        
+        self._setup_llm()
+        self._setup_embeddings(use_cloud=cloud_embeddings)
+        self._setup_service_context()
+    
+    def _setup_llm(self):
+        """Configura Velvet 7B tramite Hugging Face API"""
+        print("Configurazione Velvet 7B via Hugging Face API...")
+        
+        self.llm = HuggingFaceInferenceAPI(
+            model_name="IBM/Velvet-7B",
+            token=self.hf_token,
+            max_new_tokens=512,
+            temperature=0.7,
+            top_p=0.95,
+            repetition_penalty=1.1,
+            do_sample=True,
+            # Parametri specifici per Velvet
+            task="text-generation",
+            timeout=30
+        )
+        
+        print("✅ Velvet 7B configurato!")
+    
+    def _setup_embeddings(self, use_cloud: bool = True):
+        """Configura embedding model (cloud o locale)"""
+        print("Configurazione embedding model...")
+        
+        if use_cloud:
+            # OPZIONE 1: Hugging Face Inference API per embeddings
+            from llama_index.embeddings.huggingface import HuggingFaceInferenceAPIEmbedding
+            
+            self.embed_model = HuggingFaceInferenceAPIEmbedding(
+                model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                api_key=self.hf_token
+            )
+            print("✅ Embedding cloud (HF API) configurato!")
+            
+        else:
+            # OPZIONE 2: Embedding locale (fallback)
+            from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+            
+            self.embed_model = HuggingFaceEmbedding(
+                model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                device="cpu"
+            )
+            print("✅ Embedding locale caricato!")
+    
+    def _setup_service_context(self):
+        """Configura il service context"""
+        self.service_context = ServiceContext.from_defaults(
+            llm=self.llm,
+            embed_model=self.embed_model,
+            node_parser=SentenceSplitter(
+                chunk_size=1000,  # Ottimizzato per Velvet
+                chunk_overlap=150,
+                separator=" "
+            )
+        )
+        set_global_service_context(self.service_context)
+        print("✅ Service context configurato!")
+    
+    def load_pdf(self, pdf_path: str) -> List[Document]:
+        """Carica e processa un PDF"""
+        print(f"📄 Caricamento PDF: {pdf_path}")
+        
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"File non trovato: {pdf_path}")
+        
+        documents = []
+        
+        try:
+            with open(pdf_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                total_pages = len(pdf_reader.pages)
+                
+                for page_num, page in enumerate(pdf_reader.pages):
+                    print(f"Elaborazione pagina {page_num + 1}/{total_pages}", end="\r")
+                    
+                    text = page.extract_text()
+                    
+                    # Pulizia e normalizzazione del testo
+                    if text.strip():
+                        # Rimozione caratteri problematici
+                        text = text.replace('\n', ' ').replace('\r', ' ')
+                        text = text.replace('\t', ' ').replace('\f', ' ')
+                        # Normalizza spazi multipli
+                        text = ' '.join(text.split())
+                        
+                        # Filtra pagine troppo corte (probabilmente errori OCR)
+                        if len(text) > 50:
+                            doc = Document(
+                                text=text,
+                                metadata={
+                                    "page": page_num + 1,
+                                    "source": os.path.basename(pdf_path),
+                                    "type": "pdf",
+                                    "char_count": len(text)
+                                }
+                            )
+                            documents.append(doc)
+                
+                print(f"\n✅ Caricate {len(documents)} pagine valide dal PDF")
+                
+        except Exception as e:
+            raise Exception(f"Errore nel caricamento del PDF: {e}")
+        
+        return documents
+    
+    def create_index(self, documents: List[Document], persist: bool = True):
+        """Crea l'indice vettoriale"""
+        print("🔍 Creazione indice vettoriale...")
+        
+        if persist:
+            os.makedirs(self.persist_dir, exist_ok=True)
+            
+            # Configurazione Chroma per persistenza
+            chroma_client = chromadb.PersistentClient(path=self.persist_dir)
+            chroma_collection = chroma_client.get_or_create_collection(
+                name="velvet_rag_collection",
+                metadata={"description": "RAG con Velvet 7B"}
+            )
+            vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+            
+            self.index = VectorStoreIndex.from_documents(
+                documents,
+                storage_context=storage_context,
+                service_context=self.service_context,
+                show_progress=True
+            )
+        else:
+            self.index = VectorStoreIndex.from_documents(
+                documents,
+                service_context=self.service_context,
+                show_progress=True
+            )
+        
+        print("✅ Indice creato con successo!")
+        return self.index
+    
+    def load_existing_index(self):
+        """Carica un indice esistente"""
+        try:
+            print("🔄 Caricamento indice esistente...")
+            
+            chroma_client = chromadb.PersistentClient(path=self.persist_dir)
+            chroma_collection = chroma_client.get_or_create_collection(
+                name="velvet_rag_collection"
+            )
+            vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+            
+            self.index = VectorStoreIndex.from_vector_store(
+                vector_store,
+                service_context=self.service_context
+            )
+            
+            print("✅ Indice esistente caricato!")
+            return True
+            
+        except Exception as e:
+            print(f"⚠️ Impossibile caricare indice esistente: {e}")
+            return False
+    
+    def setup_query_engine(self, similarity_top_k: int = 3):
+        """Configura il query engine ottimizzato per Velvet"""
+        if self.index is None:
+            raise ValueError("Devi prima creare o caricare un indice!")
+        
+        self.query_engine = self.index.as_query_engine(
+            similarity_top_k=similarity_top_k,
+            response_mode="compact",
+            service_context=self.service_context
+        )
+        
+        print("✅ Query engine configurato!")
+    
+    def query(self, question: str) -> str:
+        """Effettua una query ottimizzata per Velvet 7B"""
+        if self.query_engine is None:
+            raise ValueError("Devi prima configurare il query engine!")
+        
+        print(f"❓ Domanda: {question}")
+        print("🤖 Velvet sta pensando...")
+        
+        # Prompt ottimizzato per Velvet 7B in italiano
+        optimized_prompt = f"""<|user|>
+Sei un assistente AI esperto. Basandoti ESCLUSIVAMENTE sul contesto fornito, rispondi alla domanda in italiano.
+
+Regole:
+- Usa solo le informazioni presenti nel contesto
+- Se la risposta non è nel contesto, dì "Non trovo questa informazione nel documento"
+- Sii preciso e ben strutturato
+- Cita le parti rilevanti quando possibile
+
+Domanda: {question}
+<|assistant|>
+"""
+        
+        try:
+            response = self.query_engine.query(optimized_prompt)
+            result = str(response).strip()
+            
+            # Post-processing per migliorare la risposta
+            if result.startswith("<|assistant|>"):
+                result = result.replace("<|assistant|>", "").strip()
+            
+            return result
+            
+        except Exception as e:
+            return f"❌ Errore nella query: {e}"
+    
+    def get_stats(self):
+        """Ottieni statistiche sull'indice"""
+        if self.index is None:
+            return "Nessun indice caricato"
+        
+        try:
+            # Informazioni base sull'indice
+            docstore = self.index.docstore
+            num_docs = len(docstore.docs)
+            
+            embedding_type = "Cloud (HF API)" if self.cloud_embeddings else "Locale (CPU)"
+            
+            return f"""
+📊 Statistiche Sistema RAG:
+- Documenti indicizzati: {num_docs}
+- Directory storage: {self.persist_dir}
+- Modello LLM: IBM/Velvet-7B (Cloud)
+- Modello Embedding: paraphrase-multilingual-MiniLM-L12-v2 ({embedding_type})
+- Chunk size: 1000 caratteri
+- Overlap: 150 caratteri
+- Sistema: 100% Cloud-based
+"""
+        except Exception as e:
+            return f"Errore nel recupero statistiche: {e}"
+
+def main():
+    """Funzione principale"""
+    print("🚀 === Sistema RAG con Hugging Face Velvet 7B ===")
+    print()
+    
+    # Verifica configurazione
+    if not os.getenv("HUGGINGFACE_API_KEY"):
+        print("❌ ERRORE: Manca HUGGINGFACE_API_KEY!")
+        print()
+        print("📝 Come configurare:")
+        print("1. Vai su: https://huggingface.co/settings/tokens")
+        print("2. Crea un nuovo token (Read permission)")
+        print("3. Esegui: export HUGGINGFACE_API_KEY='your-token-here'")
+        print("4. Riavvia lo script")
+        return
+    
+    try:
+        # Input modalità embedding
+        use_cloud = input("🌥️  Vuoi usare embedding cloud? (y/n, default=y): ").strip().lower()
+        cloud_embeddings = use_cloud != 'n'
+        
+        # Inizializzazione sistema
+        rag_system = VelvetRAGSystem(cloud_embeddings=cloud_embeddings)
+        
+        # Input percorso PDF
+        pdf_path = input("📁 Inserisci il percorso del manuale O'Reilly (PDF): ").strip()
+        
+        if not pdf_path:
+            print("❌ Percorso file richiesto!")
+            return
+        
+        # Caricamento/creazione indice
+        if not rag_system.load_existing_index():
+            print("📚 Primo utilizzo - creazione indice...")
+            
+            documents = rag_system.load_pdf(pdf_path)
+            if not documents:
+                print("❌ Nessun documento valido trovato nel PDF!")
+                return
+            
+            rag_system.create_index(documents, persist=True)
+        
+        # Configurazione query engine
+        rag_system.setup_query_engine(similarity_top_k=3)
+        
+        # Mostra statistiche
+        print(rag_system.get_stats())
+        
+        # Sessione interattiva
+        print("💬 Sessione Q&A avviata!")
+        print("💡 Esempi di domande:")
+        print("   - Cosa sono le reti neurali?")
+        print("   - Come funziona il machine learning?")
+        print("   - Spiegami il deep learning")
+        print()
+        print("⌨️  Scrivi 'quit' per uscire, 'stats' per statistiche")
+        print("=" * 50)
+        
+        while True:
+            question = input("\n🔮 La tua domanda: ").strip()
+            
+            if question.lower() in ['quit', 'exit', 'q']:
+                print("👋 Arrivederci!")
+                break
+            elif question.lower() == 'stats':
+                print(rag_system.get_stats())
+                continue
+            elif not question:
+                continue
+            
+            # Query e risposta
+            answer = rag_system.query(question)
+            print(f"\n🤖 Velvet risponde:\n{answer}")
+            print("-" * 50)
+                
+    except KeyboardInterrupt:
+        print("\n\n👋 Sessione interrotta dall'utente")
+    except Exception as e:
+        print(f"\n❌ Errore critico: {e}")
+
+if __name__ == "__main__":
+    main()
